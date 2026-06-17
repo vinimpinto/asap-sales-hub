@@ -1,210 +1,252 @@
-// ── ASAP Sales Hub — API de Prospecção de Leads ──────────────────────────────
-// Vercel Serverless Function
-// Busca leads no Brasil.io (API pública) e CNPJ.biz (scraping)
+// ASAP Sales Hub — API de Prospecção
+// Usa ReceitaWS (gratuita, sem auth) + CNPJ.info como fallback
 
 const axios = require('axios');
-const cheerio = require('cheerio');
 
-// ── CORS helper ───────────────────────────────────────────────────────────────
 function setCors(res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
-// ── 1. BRASIL.IO — API pública de CNPJs ──────────────────────────────────────
-async function fetchBrasilIO({ cnae, uf, limit = 20, page = 1 }) {
-  try {
-    const url = `https://brasilaberto.com/api/v1/company/search`;
-    // Brasil Aberto — proxy público sem autenticação
-    const params = {
-      cnae: cnae || '4649401',
-      uf: uf || 'RS',
-      limit,
-      page,
-    };
-    const res = await axios.get(url, { params, timeout: 8000 });
-    const companies = (res.data?.data || res.data?.results || []).slice(0, limit);
-    return companies.map(c => ({
-      empresa:   c.name || c.razao_social || c.company_name || '—',
-      cnpj:      c.cnpj || '—',
-      cidade:    c.city || c.municipio || '—',
-      uf:        c.uf || c.state || uf,
-      segmento:  cnaeToSegmento(cnae),
-      porte:     porteFromCapital(c.capital_social),
-      situacao:  c.situation || c.situacao || 'Ativa',
-      fonte:     'Brasil.io / CNAE',
-      status:    'Em qualificação',
-      temperatura: '🔵 Frio',
-      score:     '—',
-      produto:   '—',
-      valor:     '—',
-      origem_prosp: true,
-      data:      new Date().toLocaleDateString('pt-BR'),
-    }));
-  } catch (e) {
-    console.error('BrasilIO error:', e.message);
-    return [];
-  }
-}
+// Busca empresas por CNAE via API pública da ReceitaWS / CNPJ.info
+async function fetchPorCNAE({ cnae, uf, limit }) {
+  const results = [];
 
-// ── 2. CNPJ.BIZ — scraping por CNAE + UF ────────────────────────────────────
-async function fetchCNPJbiz({ cnae, uf, limit = 20 }) {
+  // ── Fonte 1: brasilaberto.com ──────────────────────────────────────────────
   try {
-    const url = `https://cnpj.biz/pesquisa/${cnae}/${uf}`;
-    const { data: html } = await axios.get(url, {
-      timeout: 10000,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; ASAP-Bot/1.0)',
-        'Accept': 'text/html',
-      }
+    const r = await axios.get('https://brasilaberto.com/api/v1/company/search', {
+      params: { cnae, uf, per_page: limit },
+      timeout: 8000,
+      headers: { 'Accept': 'application/json' }
     });
-    const $ = cheerio.load(html);
-    const results = [];
-    // Parse company rows from CNPJ.biz table
-    $('table tbody tr, .empresa-item, .result-row').each((i, el) => {
-      if (i >= limit) return false;
-      const cols = $(el).find('td');
-      const nome = cols.eq(0).text().trim() || $(el).find('.nome, .razao').text().trim();
-      const cnpj = cols.eq(1).text().trim() || $(el).find('.cnpj').text().trim();
-      const cidade = cols.eq(2).text().trim() || $(el).find('.municipio').text().trim();
-      if (nome && nome.length > 2) {
+    const items = r.data?.result || r.data?.data || r.data?.results || [];
+    items.forEach(c => {
+      results.push({
+        empresa:  c.company_name || c.name || c.razao_social || '—',
+        cnpj:     formatCNPJ(c.cnpj || ''),
+        cidade:   c.city || c.municipio || '—',
+        uf:       c.uf || uf,
+        segmento: cnaeToSeg(cnae),
+        porte:    porteFromCapital(c.capital_social),
+        fonte:    'Brasil Aberto',
+        email:    c.email || '',
+        telefone: c.phone || c.telefone || '',
+      });
+    });
+  } catch(e) {
+    console.log('BrasilAberto:', e.message);
+  }
+
+  // ── Fonte 2: CNPJA (open API) ──────────────────────────────────────────────
+  if (results.length < limit) {
+    try {
+      const r2 = await axios.get(`https://api.cnpja.com/office/search`, {
+        params: { activity: cnae, state: uf, limit, status: 2 },
+        timeout: 8000,
+        headers: { 'Accept': 'application/json', 'Authorization': 'open' }
+      });
+      const items2 = r2.data?.data || r2.data?.offices || [];
+      items2.forEach(c => {
+        const name = c.company?.name || c.alias || c.name || '';
+        if (!name) return;
         results.push({
-          empresa:   nome,
-          cnpj:      cnpj || '—',
-          cidade:    cidade || '—',
-          uf:        uf,
-          segmento:  cnaeToSegmento(cnae),
-          porte:     '—',
-          situacao:  'Ativa',
-          fonte:     'CNPJ.biz',
-          status:    'Em qualificação',
-          temperatura: '🔵 Frio',
-          score:     '—',
-          produto:   '—',
-          valor:     '—',
-          origem_prosp: true,
-          data:      new Date().toLocaleDateString('pt-BR'),
+          empresa:  name,
+          cnpj:     formatCNPJ(c.taxId || c.cnpj || ''),
+          cidade:   c.address?.city || '—',
+          uf:       c.address?.state || uf,
+          segmento: cnaeToSeg(cnae),
+          porte:    porteFromStr(c.company?.size?.id || ''),
+          fonte:    'CNPJA',
+          email:    c.emails?.[0]?.address || '',
+          telefone: c.phones?.[0]?.number || '',
         });
-      }
-    });
-    return results.slice(0, limit);
-  } catch (e) {
-    console.error('CNPJbiz error:', e.message);
-    return [];
+      });
+    } catch(e) {
+      console.log('CNPJA:', e.message);
+    }
   }
+
+  // ── Fonte 3: ReceitaWS search (fallback) ───────────────────────────────────
+  if (results.length < 3) {
+    try {
+      const r3 = await axios.get(`https://receitaws.com.br/v1/cnpj/search`, {
+        params: { query: cnaeToKeyword(cnae), uf, limit },
+        timeout: 8000,
+      });
+      const items3 = r3.data?.data || [];
+      items3.forEach(c => {
+        results.push({
+          empresa:  c.nome || '—',
+          cnpj:     formatCNPJ(c.cnpj || ''),
+          cidade:   c.municipio || '—',
+          uf:       c.uf || uf,
+          segmento: cnaeToSeg(cnae),
+          porte:    porteFromStr(c.porte || ''),
+          fonte:    'ReceitaWS',
+          email:    c.email || '',
+          telefone: c.telefone || '',
+        });
+      });
+    } catch(e) {
+      console.log('ReceitaWS search:', e.message);
+    }
+  }
+
+  return results;
 }
 
-// ── 3. RECEITAWS — API gratuita de CNPJ individual ───────────────────────────
-async function enrichCNPJ(cnpj) {
-  if (!cnpj || cnpj === '—') return {};
-  const clean = cnpj.replace(/\D/g, '');
-  try {
-    const { data } = await axios.get(`https://receitaws.com.br/v1/cnpj/${clean}`, {
-      timeout: 5000
+// ── Gera leads de demonstração realistas quando APIs externas não respondem ──
+function gerarLeadsMock({ cnae, uf, limit }) {
+  const seg = cnaeToSeg(cnae);
+  const cidades = {
+    RS: ['Porto Alegre','Caxias do Sul','Pelotas','Santa Maria','Novo Hamburgo','São Leopoldo','Passo Fundo'],
+    SC: ['Florianópolis','Joinville','Blumenau','Chapecó','Itajaí','Criciúma','Lages'],
+    PR: ['Curitiba','Londrina','Maringá','Ponta Grossa','Cascavel','Foz do Iguaçu','Guarapuava'],
+    SP: ['São Paulo','Campinas','Ribeirão Preto','Santos','São Bernardo','Sorocaba','Osasco'],
+  };
+  const nomesBase = {
+    Distribuidor: ['Distribuidora','Atacado','Comércio','Suprimentos','Logística'],
+    Importador:   ['Importadora','Trading','Internacional','Global','Import'],
+    Indústria:    ['Indústria','Fábrica','Manufatura','Produtos','Confecções'],
+    Varejo:       ['Loja','Comércio','Varejo','Store','Mercado'],
+  };
+  const produtos = {
+    '4649': 'Art. Domésticos','4644': 'Farmacêuticos','4645': 'Eletroeletrônicos',
+    '4642': 'Vestuário','4631': 'Alimentos','4659': 'Equipamentos',
+  };
+  const cidadeList = cidades[uf] || cidades['RS'];
+  const prefList = nomesBase[seg] || ['Empresa'];
+  const sufList = ['Sul','Norte','Brasil','RS','Prime','Max','Plus','Total','Express','Master'];
+  const prod = produtos[String(cnae).slice(0,4)] || 'Produtos';
+
+  const leads = [];
+  for (let i = 0; i < limit; i++) {
+    const pref = prefList[i % prefList.length];
+    const suf = sufList[i % sufList.length];
+    const cidade = cidadeList[i % cidadeList.length];
+    const num = String(Math.floor(Math.random()*90+10));
+    const cnpjFake = `${num}.${Math.floor(Math.random()*900+100)}.${Math.floor(Math.random()*900+100)}/0001-${Math.floor(Math.random()*90+10)}`;
+    leads.push({
+      empresa:  `${pref} ${prod} ${suf} ${i+1 > 1 ? num : ''}`.trim(),
+      cnpj:     cnpjFake,
+      cidade,
+      uf,
+      segmento: seg,
+      porte:    ['Micro','Pequeno','Médio'][i % 3],
+      fonte:    '📋 Demonstração (APIs externas indisponíveis)',
+      email:    '',
+      telefone: '',
+      demo:     true,
     });
-    return {
-      email:    data.email || '',
-      telefone: data.telefone || '',
-      porte:    porteFromReceitaWS(data.porte),
-      endereco: `${data.logradouro||''}, ${data.municipio||''} - ${data.uf||''}`.trim(),
-      situacao: data.situacao || 'ATIVA',
-    };
-  } catch (e) {
-    return {};
   }
+  return leads;
 }
 
-// ── HELPERS ───────────────────────────────────────────────────────────────────
-function cnaeToSegmento(cnae) {
-  const str = String(cnae || '');
-  if (str.startsWith('464') || str.startsWith('463') || str.startsWith('465')) return 'Distribuidor';
-  if (str.startsWith('46') || str.startsWith('51')) return 'Importador';
-  if (str.startsWith('471') || str.startsWith('472') || str.startsWith('476')) return 'Varejo';
-  if (str.startsWith('10') || str.startsWith('22') || str.startsWith('32')) return 'Indústria';
+// ── HELPERS ──────────────────────────────────────────────────────────────────
+function formatCNPJ(s) {
+  const d = s.replace(/\D/g,'');
+  if (d.length !== 14) return s || '—';
+  return `${d.slice(0,2)}.${d.slice(2,5)}.${d.slice(5,8)}/${d.slice(8,12)}-${d.slice(12)}`;
+}
+
+function cnaeToSeg(cnae) {
+  const s = String(cnae||'');
+  if (s.startsWith('464')||s.startsWith('463')||s.startsWith('465')) return 'Distribuidor';
+  if (s.startsWith('51')) return 'Importador';
+  if (s.startsWith('471')||s.startsWith('472')||s.startsWith('476')) return 'Varejo';
+  if (s.startsWith('10')||s.startsWith('22')||s.startsWith('32')) return 'Indústria';
   return 'Distribuidor';
 }
 
-function porteFromCapital(capital) {
-  const v = parseFloat(String(capital || '0').replace(/[^\d.]/g, ''));
-  if (v <= 0)       return '—';
-  if (v < 360000)   return 'Micro';
-  if (v < 4800000)  return 'Pequeno';
-  if (v < 300000000) return 'Médio';
+function cnaeToKeyword(cnae) {
+  const m = {'4649':'artigos domesticos','4644':'farmaceuticos','4645':'eletronicos',
+             '4642':'vestuario','4631':'alimentos','4659':'equipamentos'};
+  return m[String(cnae).slice(0,4)] || 'distribuidor';
+}
+
+function porteFromCapital(cap) {
+  const v = parseFloat(String(cap||0).replace(/[^\d.]/g,''));
+  if (!v)       return '—';
+  if (v<360000) return 'Micro';
+  if (v<4800000) return 'Pequeno';
+  if (v<300000000) return 'Médio';
   return 'Grande';
 }
 
-function porteFromReceitaWS(porte) {
-  const p = (porte || '').toUpperCase();
-  if (p.includes('MICRO') || p.includes('MEI')) return 'Micro';
-  if (p.includes('PEQUENO') || p.includes('EPP')) return 'Pequeno';
-  if (p.includes('MEDIO') || p.includes('MÉDIO')) return 'Médio';
-  if (p.includes('GRANDE')) return 'Grande';
+function porteFromStr(s) {
+  const p = (s||'').toUpperCase();
+  if (p.includes('ME')||p.includes('MEI')||p.includes('01')) return 'Micro';
+  if (p.includes('EPP')||p.includes('02')) return 'Pequeno';
+  if (p.includes('03')||p.includes('MED')) return 'Médio';
+  if (p.includes('04')||p.includes('GRA')) return 'Grande';
   return '—';
 }
 
-function dedup(leads) {
+function dedup(arr) {
   const seen = new Set();
-  return leads.filter(l => {
-    const key = (l.cnpj && l.cnpj !== '—') ? l.cnpj : l.empresa.toLowerCase();
+  return arr.filter(l => {
+    const key = l.cnpj && l.cnpj !== '—' ? l.cnpj : l.empresa.toLowerCase().trim();
     if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
+    seen.add(key); return true;
   });
 }
 
-// ── MAIN HANDLER ──────────────────────────────────────────────────────────────
+// ── HANDLER ───────────────────────────────────────────────────────────────────
 module.exports = async (req, res) => {
   setCors(res);
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const {
-    cnaes   = '4649401,4644301,4645101',
-    ufs     = 'RS,SC,PR',
-    limit   = 50,
-    enrich  = 'false',
-    fonte   = 'all',
+    cnaes = '4649401,4644301,4645101',
+    ufs   = 'RS,SC,PR',
+    limit = '50',
   } = req.query;
 
   const cnaeList = cnaes.split(',').map(s => s.trim()).filter(Boolean);
   const ufList   = ufs.split(',').map(s => s.trim()).filter(Boolean);
-  const perQuery = Math.ceil(Number(limit) / (cnaeList.length * ufList.length));
+  const total    = parseInt(limit) || 50;
+  const perQ     = Math.max(5, Math.ceil(total / (cnaeList.length * ufList.length)));
 
   let all = [];
 
+  // Try real APIs
   for (const cnae of cnaeList) {
     for (const uf of ufList) {
-      if (fonte !== 'cnpjbiz') {
-        const bio = await fetchBrasilIO({ cnae, uf, limit: perQuery });
-        all = all.concat(bio);
-      }
-      if (fonte !== 'brasilaberto') {
-        const cbiz = await fetchCNPJbiz({ cnae, uf, limit: perQuery });
-        all = all.concat(cbiz);
-      }
+      const batch = await fetchPorCNAE({ cnae, uf, limit: perQ });
+      all = all.concat(batch);
     }
   }
 
-  // Deduplicate
-  all = dedup(all).slice(0, Number(limit));
+  all = dedup(all).slice(0, total);
 
-  // Optional enrichment (slow — only when requested)
-  if (enrich === 'true') {
-    all = await Promise.all(all.map(async lead => {
-      if (lead.cnpj && lead.cnpj !== '—') {
-        const extra = await enrichCNPJ(lead.cnpj);
-        return { ...lead, ...extra };
+  // If APIs returned nothing, use demo data
+  if (all.length === 0) {
+    for (const cnae of cnaeList.slice(0,2)) {
+      for (const uf of ufList.slice(0,2)) {
+        all = all.concat(gerarLeadsMock({ cnae, uf, limit: Math.ceil(total/4) }));
       }
-      return lead;
-    }));
+    }
+    all = dedup(all).slice(0, total);
   }
 
-  // Add unique IDs
-  all = all.map((l, i) => ({ ...l, id: Date.now() + i }));
+  // Add IDs and timestamps
+  all = all.map((l, i) => ({
+    ...l,
+    id:     Date.now() + i,
+    status: 'Em qualificação',
+    temperatura: '🔵 Frio',
+    score:  '—',
+    produto:'—',
+    valor:  '—',
+    origem_prosp: true,
+    data:   new Date().toLocaleDateString('pt-BR'),
+  }));
 
   res.status(200).json({
-    total: all.length,
+    total:     all.length,
     timestamp: new Date().toISOString(),
-    leads: all,
+    demo:      all.some(l => l.demo),
+    leads:     all,
   });
 };
