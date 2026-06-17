@@ -662,6 +662,31 @@ html,body{height:100%;background:var(--dark);color:var(--text);font-size:14px;ov
         <a href="https://brasil.io" target="_blank" class="fonte-link">Acessar →</a>
       </div>
 
+      <div class="fonte-card fonte-card-wide" style="border-color:rgba(255,226,39,.3)">
+        <div class="fonte-icon">⚡</div>
+        <div class="fonte-name" style="color:var(--y)">Busca Automática — Ativada</div>
+        <div class="fonte-desc">A plataforma está hospedada e conectada. Clique abaixo para buscar leads diretamente do Brasil.io e CNPJ.biz com base no seu ICP configurado.</div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;margin-top:8px">
+          <div class="form-group">
+            <label>CNAEs (separados por vírgula)</label>
+            <input type="text" id="api-cnaes" value="4649401,4644301,4645101" style="background:var(--card);border:1px solid var(--border);color:var(--text);font-family:Inter,sans-serif;font-size:12px;padding:8px 10px;border-radius:6px;outline:none">
+          </div>
+          <div class="form-group">
+            <label>Estados</label>
+            <input type="text" id="api-ufs" value="RS,SC,PR" style="background:var(--card);border:1px solid var(--border);color:var(--text);font-family:Inter,sans-serif;font-size:12px;padding:8px 10px;border-radius:6px;outline:none">
+          </div>
+          <div class="form-group">
+            <label>Quantidade de leads</label>
+            <input type="number" id="api-limit" value="50" min="5" max="100" style="background:var(--card);border:1px solid var(--border);color:var(--text);font-family:Inter,sans-serif;font-size:12px;padding:8px 10px;border-radius:6px;outline:none">
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:12px">
+          <button class="btn-add-lead" onclick="buscarLeadsAPI()" id="btn-buscar">🔍 Buscar Leads Agora</button>
+          <div id="api-status" style="font-size:12px;color:var(--muted)"></div>
+        </div>
+        <div id="api-preview" style="margin-top:14px"></div>
+      </div>
+
       <div class="fonte-card">
         <div class="fonte-icon">🛍️</div>
         <div class="fonte-name">Mercado Livre (sellers)</div>
@@ -1049,6 +1074,9 @@ html,body{height:100%;background:var(--dark);color:var(--text);font-size:14px;ov
 <div id="pdf-target"></div>
 
 <script>
+// ── CONFIG ───────────────────────────────────────────────────────────────────
+var API_BASE = 'https://asap-sales-hub-xi9o.vercel.app/api';
+
 // ── STATE ────────────────────────────────────────────────────────────────────
 var scores = {need:null,budget:null,timing:null,auth:null};
 var extra = {produto:null,equipe:null,dinheiro:null};
@@ -2174,6 +2202,111 @@ function importLote(){
   document.getElementById('lote-input').value='';
   document.getElementById('lote-preview').innerHTML='';
   showToast('✅ '+count+' lead(s) importado(s) para o pipeline!');
+}
+
+// ── BUSCA VIA API ────────────────────────────────────────────────────────────
+async function buscarLeadsAPI(){
+  var btn = document.getElementById('btn-buscar');
+  var status = document.getElementById('api-status');
+  var preview = document.getElementById('api-preview');
+  var cnaes = document.getElementById('api-cnaes').value||'4649401';
+  var ufs = document.getElementById('api-ufs').value||'RS';
+  var limit = document.getElementById('api-limit').value||'50';
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Buscando...';
+  status.textContent = 'Consultando Brasil.io e CNPJ.biz...';
+  status.style.color = 'var(--y2)';
+  preview.innerHTML = '';
+
+  try {
+    var url = API_BASE + '/leads?cnaes='+encodeURIComponent(cnaes)+'&ufs='+encodeURIComponent(ufs)+'&limit='+limit;
+    var res = await fetch(url);
+    if(!res.ok) throw new Error('Erro HTTP '+res.status);
+    var data = await res.json();
+    var leads = data.leads || [];
+
+    if(leads.length === 0){
+      status.textContent = 'Nenhum lead encontrado. Tente outros CNAEs ou estados.';
+      status.style.color = 'var(--red)';
+      btn.disabled = false; btn.textContent = '🔍 Buscar Leads Agora';
+      return;
+    }
+
+    // Preview table
+    preview.innerHTML =
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">'+leads.length+' leads encontrados — clique em Importar para adicionar ao pipeline:</div>'+
+      '<div style="overflow-x:auto;max-height:280px;overflow-y:auto">'+
+      '<table class="lote-preview-table"><thead><tr>'+
+        '<th>#</th><th>Empresa</th><th>CNPJ</th><th>Cidade</th><th>Segmento</th><th>Fonte</th>'+
+      '</tr></thead><tbody>'+
+      leads.map(function(l,i){
+        return '<tr>'+
+          '<td style="color:var(--muted)">'+(i+1)+'</td>'+
+          '<td style="font-weight:700">'+l.empresa+'</td>'+
+          '<td style="color:var(--muted);font-size:10px">'+l.cnpj+'</td>'+
+          '<td>'+l.cidade+' - '+l.uf+'</td>'+
+          '<td><span class="pipe-prod">'+l.segmento+'</span></td>'+
+          '<td style="color:var(--muted);font-size:10px">'+l.fonte+'</td>'+
+        '</tr>';
+      }).join('')+
+      '</tbody></table></div>'+
+      '<div style="margin-top:12px;display:flex;gap:10px">'+
+        '<button class="btn-add-lead" onclick="importarLeadsAPI(window._apiLeads)">⬆ Importar todos para o Pipeline</button>'+
+        '<span style="font-size:11px;color:var(--muted);align-self:center">Duplicatas serão ignoradas automaticamente</span>'+
+      '</div>';
+
+    window._apiLeads = leads;
+    status.textContent = leads.length+' leads prontos para importar';
+    status.style.color = 'var(--green)';
+
+  } catch(e) {
+    status.textContent = 'Erro: '+e.message+'. Verifique se a API está no ar.';
+    status.style.color = 'var(--red)';
+    console.error(e);
+  }
+
+  btn.disabled = false;
+  btn.textContent = '🔍 Buscar Leads Agora';
+}
+
+function importarLeadsAPI(leads){
+  if(!leads || !leads.length) return;
+  var vend = document.getElementById('lote-vend') ? document.getElementById('lote-vend').value : '—';
+  var count = 0;
+  leads.forEach(function(l){
+    var existing = pipeline.find(function(p){
+      return p.cnpj && p.cnpj!=='—' && p.cnpj===l.cnpj ||
+             p.empresa.toLowerCase()===l.empresa.toLowerCase();
+    });
+    if(existing) return;
+    pipeline.unshift({
+      id: l.id || Date.now()+Math.random(),
+      data: new Date().toLocaleDateString('pt-BR'),
+      empresa: l.empresa,
+      cnpj: l.cnpj||'—',
+      segmento: l.segmento||'—',
+      porte: l.porte||'—',
+      cidade: l.cidade||'—',
+      vendedor: vend||'—',
+      produto: '—',
+      valor: '—',
+      score: '—',
+      temperatura: '🔵 Frio',
+      status: 'Em qualificação',
+      origem: l.fonte||'API',
+      origem_prosp: true
+    });
+    count++;
+  });
+  savePipeline();
+  updatePipeStats();
+  renderPipeline();
+  updateMetaBar();
+  renderLeadsHoje();
+  document.getElementById('api-preview').innerHTML='<div style="padding:12px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:8px;font-size:12px;color:var(--green)">✅ '+count+' leads importados para o pipeline! '+( (leads.length-count)>0 ? (leads.length-count)+' duplicatas ignoradas.':'' )+'</div>';
+  showToast('✅ '+count+' leads importados!');
+  window._apiLeads = null;
 }
 
 // ── GOTO UPDATE for prosp ─────────────────────────────────────────────────────
